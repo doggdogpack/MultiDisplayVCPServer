@@ -1,0 +1,13 @@
+[Unit]
+Description=MultiDisplayVCP Server DDC/CI Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/MultiDisplayVCPServer.Linux --port 5001 --grpc-port 5002
+Restart=on-failure
+RestartSec=5s
+Environment=DOTNET_CLI_TELEMETRY_OPTOUT=1
+
+[Install]
+WantedBy=multi-user.target
