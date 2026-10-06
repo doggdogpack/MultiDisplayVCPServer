@@ -1,0 +1,16 @@
+<Project>
+  <PropertyGroup>
+    <!-- Prevent git commit SHA from appending to assembly informational version and packaging filenames -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="Exists('$(MSBuildThisFileDirectory)..\..\BuildOut')">
+    <!-- Keep Source/ clean when built from MultiDisplayVCP root: redirect bin and obj to BuildOut\Server -->
+    <BaseOutputPath>$(MSBuildThisFileDirectory)..\..\BuildOut\Server\bin\</BaseOutputPath>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)..\..\BuildOut\Server\obj\</BaseIntermediateOutputPath>
+
+    <!-- Ensure trailing slashes for MSBuild safety -->
+    <OutputPath>$(BaseOutputPath)$(Configuration)\</OutputPath>
+    <IntermediateOutputPath>$(BaseIntermediateOutputPath)$(Configuration)\</IntermediateOutputPath>
+  </PropertyGroup>
+</Project>

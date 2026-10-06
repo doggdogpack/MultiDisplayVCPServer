@@ -1,9 +1,19 @@
+using MagicOnion.Server;
+using MessagePipe;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
+using MultiDisplayVCPServer.Messaging;
 using MultiDisplayVCPServer.Properties;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -66,16 +76,63 @@ namespace MultiDisplayVCPServer
         }
 
         private static ServerStatus _monitorCache = new();
+        private static volatile bool _cacheWarming = true;
+        private static Task? _cacheWarmTask;
         private static readonly object _cacheLock = new();
         private static readonly char[] _pipeDelimiter = new[] { '|' };
         private static readonly JsonSerializerOptions _jsonOptions = new JsonSerializerOptions { WriteIndented = true };
 
         /// <summary>
+        /// Indicates whether the initial background monitor capability scan is still running.
+        /// </summary>
+        public static bool IsCacheWarming => _cacheWarming;
+
+        /// <summary>
+        /// Waits for the initial monitor capability scan to complete, up to timeoutMs.
+        /// </summary>
+        public static async Task EnsureCacheWarmedAsync(int timeoutMs = 15000)
+        {
+            var task = _cacheWarmTask;
+            if (task != null && !task.IsCompleted)
+            {
+                await Task.WhenAny(task, Task.Delay(timeoutMs));
+            }
+        }
+
+        /// <summary>
+        /// The ASP.NET Core WebApplication hosting the MagicOnion gRPC endpoint.
+        /// Runs alongside the existing TCP listener (dual-mode).
+        /// </summary>
+        private static WebApplication? _grpcApp;
+
+        /// <summary>
+        /// Returns a snapshot of the current monitor cache.
+        /// Returns a "warming up" status if the initial background scan has not yet completed.
+        /// Used by MonitorController.GetCachedCapabilities() for the gRPC path.
+        /// </summary>
+        public static ServerStatus GetCachedStatus()
+        {
+            if (_cacheWarming)
+                return new ServerStatus { Message = "WARMING: Monitor cache is still initializing. Please retry shortly." };
+
+            lock (_cacheLock)
+            {
+                return _monitorCache;
+            }
+        }
+
+        /// <summary>
         /// The main entry point for the application.
         /// </summary>
         [STAThread]
-        public static void Main(string[] _)
+        public static void Main(string[] args)
         {
+            if (args != null && args.Any(a => a.Equals("--dump", StringComparison.OrdinalIgnoreCase) || a.Equals("--scan", StringComparison.OrdinalIgnoreCase)))
+            {
+                GetMonitorCapabilities();
+                return;
+            }
+
             Log("Main() started.");
             bool createdNew = false;
             try
@@ -128,6 +185,11 @@ namespace MultiDisplayVCPServer
             cts = new CancellationTokenSource();
             listenerTask = Task.Run(() => ListenerLoopAsync(cts.Token));
             Log("Server startup initiated...");
+
+            // Also start the MagicOnion gRPC host in dual-mode alongside the TCP server
+            int grpcPort = Settings.Default.GrpcPort;
+            Log($"Starting gRPC host on port {grpcPort}...");
+            _ = StartGrpcHostAsync(grpcPort, cts.Token);
         }
 
         /// <summary>
@@ -140,6 +202,10 @@ namespace MultiDisplayVCPServer
             Log("CancellationTokenSource cancel requested.");
             listener?.Stop();
             Log("TCP listener stop requested.");
+
+            // Also stop the MagicOnion gRPC host
+            Log("Requesting gRPC host stop...");
+            _ = StopGrpcHostAsync();
             Log("ShutdownServer() finished.");
         }
 
@@ -185,13 +251,15 @@ namespace MultiDisplayVCPServer
                 // --- THIS LOG IS MOVED UP ---
                 Log($"Server listener started on port {port}.");
 
-                // --- Build the cache on startup FIRST ---
-                Log("Building initial monitor cache... (This may take a few seconds)");
-                await BuildMonitorCacheAsync();
-                Log("Cache built. Server is ready and waiting for connections.");
-
-                Log("Setting server state to 1 (Running).");
+                // Mark the server as Running immediately so the splash screen closes
+                // and the UI is responsive. The monitor cache builds in the background.
+                Log("TCP listener bound. Setting server state to 1 (Running).");
                 SetServerState(1);
+
+                // Build the cache in the background — GET_CAPS will return a
+                // "warming up" message until the first scan completes.
+                Log("Starting background monitor cache build...");
+                _cacheWarmTask = BuildMonitorCacheAsync();
 
                 while (!token.IsCancellationRequested)
                 {
@@ -256,7 +324,7 @@ namespace MultiDisplayVCPServer
             Log("GetMonitorCapabilities task completed.");
             sw.Stop();
 
-            // Safely replace the old cache with the new one
+            // Safely replace the old cache with the new one and clear the warming flag
             Log("Safely replacing old cache with new cache...");
             lock (_cacheLock)
             {
@@ -264,6 +332,7 @@ namespace MultiDisplayVCPServer
                 _monitorCache = newStatus;
                 Log("Cache lock released.");
             }
+            _cacheWarming = false;
             Log($"Monitor scan complete in {sw.ElapsedMilliseconds}ms. Found {_monitorCache.Monitors.Count} monitors.");
             Log("BuildMonitorCacheAsync() finished.");
         }
@@ -271,13 +340,16 @@ namespace MultiDisplayVCPServer
         /// <summary>
         /// Updates a single value in the cache after a successful SET command.
         /// </summary>
-        private static void UpdateCache(string pnpId, byte vcpCode, uint newValue)
+        public static void UpdateCache(string pnpId, byte vcpCode, uint newValue)
         {
             Log($"UpdateCache() started for {pnpId}: 0x{vcpCode:X2} = {newValue}");
             lock (_cacheLock)
             {
                 Log("Cache lock acquired.");
-                var monitor = _monitorCache.Monitors.FirstOrDefault(m => m.DeviceID == pnpId);
+                var monitor = _monitorCache.Monitors.FirstOrDefault(m =>
+                    m.DeviceID.Equals(pnpId, StringComparison.OrdinalIgnoreCase) ||
+                    m.Description.Equals(pnpId, StringComparison.OrdinalIgnoreCase) ||
+                    m.DeviceID.Contains(pnpId, StringComparison.OrdinalIgnoreCase));
                 if (monitor != null)
                 {
                     var feature = monitor.Capabilities.FirstOrDefault(f => f.Code == vcpCode);
@@ -458,9 +530,24 @@ namespace MultiDisplayVCPServer
             Log($"ExecuteDdcCiCommand() started. Command: {command}");
             isJson = false;
 
-            if (command.Equals("GET_CAPS", StringComparison.OrdinalIgnoreCase))
+            if (command.Equals("PING", StringComparison.OrdinalIgnoreCase))
+            {
+                Log("Command is PING. Returning OK.");
+                Log("ExecuteDdcCiCommand() finished.");
+                return "OK: PONG";
+            }
+            else if (command.Equals("GET_CAPS", StringComparison.OrdinalIgnoreCase))
             {
                 isJson = true;
+
+                if (_cacheWarming)
+                {
+                    try
+                    {
+                        EnsureCacheWarmedAsync(10000).GetAwaiter().GetResult();
+                    }
+                    catch { }
+                }
 
                 Log("Executing GET_CAPS from cache.");
                 lock (_cacheLock)
@@ -561,46 +648,33 @@ namespace MultiDisplayVCPServer
                 return (IntPtr)(-1);
             }
 
-            // 1. Get the WMI map of PnP_ID -> DDC/CI Description
-            Log("Getting WMI map (from cache or new query)...");
             var pnpMap = MonitorWmiHelper.GetPnPMonitorMap();
-            if (!pnpMap.TryGetValue(targetPnP_ID, out string targetDescription))
-            {
-                Log($"Error: Could not find PnP_ID {targetPnP_ID} in WMI map.");
-                return (IntPtr)(-1);
-            }
-            Log($"Target DDC/CI Description is: {targetDescription}");
+            pnpMap.TryGetValue(targetPnP_ID, out string? targetDescription);
 
-            // 2. Enumerate all monitors
+            // Enumerate all physical monitors with native PnP ID detection
             Log("Enumerating all physical monitors...");
-            var monitors = MonitorController.EnumeratePhysicalMonitors(new Dictionary<string, string>());
+            var monitors = MonitorController.EnumeratePhysicalMonitors(MonitorWmiHelper.GetMonitorPnPMap());
             Log($"Found {monitors.Count} physical monitors.");
             IntPtr foundHandle = (IntPtr)(-1);
 
-            // 3. Find the monitor with the matching DDC/CI Description
-            Log("Searching for monitor with matching description...");
+            // Match monitor directly by PnP ID, DeviceID, or Description
+            Log("Searching for monitor matching PnP ID...");
             foreach (var monitor in monitors)
             {
-                if (monitor.Description.Equals(targetDescription, StringComparison.OrdinalIgnoreCase))
-                {
-                    // Test if this is the real monitor by checking for Input Select (0x60)
-                    uint current = 0, max = 0;
-                    MonitorController.MONITOR_CAPABILITIES_REQUEST_TYPE type = 0;
+                bool matches = monitor.PnP_ID.Equals(targetPnP_ID, StringComparison.OrdinalIgnoreCase)
+                            || monitor.DeviceID.Equals(targetPnP_ID, StringComparison.OrdinalIgnoreCase)
+                            || monitor.PnP_ID.Contains(targetPnP_ID, StringComparison.OrdinalIgnoreCase)
+                            || (!string.IsNullOrEmpty(targetDescription) && monitor.Description.Equals(targetDescription, StringComparison.OrdinalIgnoreCase));
 
-                    if (MonitorController.GetVCPFeatureAndVCPFeatureReply(monitor.Handle, 0x60, ref type, ref current, ref max))
-                    {
-                        foundHandle = monitor.Handle;
-                        Log($"Found REAL handle {foundHandle} for {targetDescription}");
-                        break;
-                    }
-                    else
-                    {
-                        Log($"Found dummy/capture card handle for {targetDescription}. Ignoring.");
-                    }
+                if (matches)
+                {
+                    foundHandle = monitor.Handle;
+                    Log($"Found matching handle {foundHandle} for target {targetPnP_ID} ({monitor.Description})");
+                    break;
                 }
             }
 
-            // 4. Clean up other handles
+            // Clean up other handles
             Log("Cleaning up other monitor handles...");
             foreach (var monitor in monitors)
             {
@@ -614,81 +688,139 @@ namespace MultiDisplayVCPServer
         }
 
         /// <summary>
-        /// Gathers capabilities from all DDC/CI-compliant monitors and returns them as a JSON string.
+        /// Gathers capabilities from all DDC/CI-compliant monitors, builds the status cache,
+        /// and dumps a full diagnostic breakdown to monitor_dump.json.
         /// </summary>
-        /// <returns>A JSON string representing the ServerStatus object.</returns>
+        /// <returns>A ServerStatus object representing all discovered monitors.</returns>
         static ServerStatus GetMonitorCapabilities()
         {
             Log("GetMonitorCapabilities() started.");
+            var sw = Stopwatch.StartNew();
+
             // 1. Get the map of DDC/CI Description -> PnP Model ID
             Log("Getting WMI map (from cache or new query)...");
             var pnpMap = MonitorWmiHelper.GetMonitorPnPMap();
             Log($"Found {pnpMap.Count} monitors in WMI.");
 
-            List<MonitorInfo> monitorList = new();
-
             // 2. Enumerate all physical monitors
             Log("Enumerating all physical monitors...");
             var physicalMonitors = MonitorController.EnumeratePhysicalMonitors(pnpMap);
-            Log($"Found {physicalMonitors.Count} DDC/CI monitors.");
+            Log($"Found {physicalMonitors.Count} physical monitor handles.");
 
+            var monitorList = new List<MonitorInfo>();
+            var monitorDiags = new List<Dictionary<string, object?>>();
+
+            // Sequential enumeration avoids I2C bus contention across display adapter ports
             foreach (var pMon in physicalMonitors)
             {
-                Log($"Processing monitor: {pMon.Description} (PnP: {pMon.PnP_ID})");
+                Log($"Processing monitor: {pMon.Description} (PnP: {pMon.PnP_ID}, Device: {pMon.DeviceID})");
                 IntPtr hMonitor = pMon.Handle;
-
-                // 3. Check for stable PnP_ID (if it's missing, we can't use this monitor)
-                if (string.IsNullOrEmpty(pMon.PnP_ID))
+                var monDiag = new Dictionary<string, object?>
                 {
-                    Log($"Skipping monitor {pMon.Description}: Could not find matching PnP_ID in WMI.");
-                    MonitorController.DestroyPhysicalMonitor(hMonitor);
-                    continue;
+                    ["PnP_ID"] = pMon.PnP_ID,
+                    ["Description"] = pMon.Description,
+                    ["DeviceID"] = pMon.DeviceID,
+                    ["Handle"] = "0x" + hMonitor.ToString("X")
+                };
+
+                try
+                {
+                    // 3. Check for stable PnP_ID
+                    if (string.IsNullOrEmpty(pMon.PnP_ID))
+                    {
+                        Log($"Skipping monitor {pMon.Description}: Could not find matching PnP_ID.");
+                        monDiag["Status"] = "Skipped";
+                        monDiag["Reason"] = "Missing PnP_ID";
+                        monitorDiags.Add(monDiag);
+                        continue;
+                    }
+
+                    // 4. Get capabilities string length
+                    Log($"Getting capabilities string length for {pMon.Description}...");
+                    uint length = 0;
+                    bool okLen = MonitorController.GetCapabilitiesStringLength(hMonitor, ref length);
+                    int lastError = Marshal.GetLastWin32Error();
+                    monDiag["CapabilitiesLengthSuccess"] = okLen;
+                    monDiag["CapabilitiesLength"] = length;
+                    monDiag["Win32Error"] = lastError;
+
+                    if (!okLen || length == 0)
+                    {
+                        Log($"Skipping monitor {pMon.Description}: Failed to get capabilities string length (Win32 Error: {lastError}).");
+                        monDiag["Status"] = "Skipped";
+                        monDiag["Reason"] = $"GetCapabilitiesStringLength failed or returned 0 (Win32 Error {lastError})";
+                        monitorDiags.Add(monDiag);
+                        continue;
+                    }
+
+                    Log($"Capabilities string length: {length}");
+                    StringBuilder sb = new StringBuilder((int)length);
+                    bool okReply = MonitorController.CapabilitiesRequestAndCapabilitiesReply(hMonitor, sb, length);
+                    monDiag["CapabilitiesReplySuccess"] = okReply;
+                    monDiag["CapabilitiesString"] = sb.ToString();
+
+                    if (!okReply)
+                    {
+                        Log($"Skipping monitor {pMon.Description}: Failed to get capabilities string.");
+                        monDiag["Status"] = "Skipped";
+                        monDiag["Reason"] = "CapabilitiesRequestAndCapabilitiesReply failed";
+                        monitorDiags.Add(monDiag);
+                        continue;
+                    }
+
+                    Log($"Capabilities string: {sb}");
+
+                    // 5. Discover all VCP features
+                    Log($"Discovering VCP features for {pMon.Description}...");
+                    List<VcpFeature> features = DiscoverAllVcpFeatures(hMonitor, sb.ToString());
+                    monDiag["FeaturesCount"] = features.Count;
+
+                    // The Dummy Filter: If it has less than 10 features, it's a capture card.
+                    if (features.Count < 10)
+                    {
+                        Log($"Skipping {pMon.Description}: Only found {features.Count} features. Likely a capture card.");
+                        monDiag["Status"] = "Skipped";
+                        monDiag["Reason"] = $"Only found {features.Count} features (< 10). Likely a capture card.";
+                        monitorDiags.Add(monDiag);
+                        continue;
+                    }
+
+                    Log($"Discovered {features.Count} features for {pMon.Description}. Adding to cache.");
+                    monDiag["Status"] = "Included";
+                    monDiag["Features"] = features.Select(f => new
+                    {
+                        Code = $"0x{f.Code:X2}",
+                        f.Name,
+                        f.Type,
+                        f.CurrentValue,
+                        f.MaximumValue,
+                        NonContinuousValues = f.NonContinuousValues
+                    }).ToList();
+                    monitorDiags.Add(monDiag);
+
+                    monitorList.Add(new MonitorInfo
+                    {
+                        DeviceID = pMon.PnP_ID,
+                        Description = pMon.Description,
+                        Capabilities = features
+                    });
                 }
-
-                // 4. Get capabilities string
-                Log($"Getting capabilities string length for {pMon.Description}...");
-                uint length = 0;
-                if (!MonitorController.GetCapabilitiesStringLength(hMonitor, ref length))
+                catch (Exception ex)
                 {
-                    Log($"Skipping monitor {pMon.Description}: Failed to get capabilities string length.");
-                    MonitorController.DestroyPhysicalMonitor(hMonitor);
-                    continue;
+                    Log($"Exception processing monitor {pMon.Description}: {ex.Message}");
+                    monDiag["Status"] = "Error";
+                    monDiag["Exception"] = ex.ToString();
+                    monitorDiags.Add(monDiag);
                 }
-                Log($"Capabilities string length: {length}");
-
-                StringBuilder sb = new StringBuilder((int)length);
-                if (!MonitorController.CapabilitiesRequestAndCapabilitiesReply(hMonitor, sb, length))
+                finally
                 {
-                    Log($"Skipping monitor {pMon.Description}: Failed to get capabilities string.");
+                    Log($"Destroying handle for {pMon.Description}.");
                     MonitorController.DestroyPhysicalMonitor(hMonitor);
-                    continue;
                 }
-                Log($"Capabilities string: {sb.ToString()}");
-
-                // 5. Discover all VCP features
-                Log($"Discovering VCP features for {pMon.Description}...");
-                List<VcpFeature> features = DiscoverAllVcpFeatures(hMonitor, sb.ToString());
-
-                // The Dummy Filter: If it has less than 10 features, it's a capture card.
-                if (features.Count < 10)
-                {
-                    Log($"Skipping {pMon.Description}: Only found {features.Count} features. Likely a capture card.");
-                    MonitorController.DestroyPhysicalMonitor(hMonitor);
-                    continue;
-                }
-
-                Log($"Discovered {features.Count} features. Adding to cache.");
-
-                monitorList.Add(new MonitorInfo
-                {
-                    DeviceID = pMon.PnP_ID, // The stable Model ID
-                    Description = pMon.Description, // The DDC/CI Name
-                    Capabilities = features
-                });
-
-                Log($"Destroying handle for {pMon.Description}.");
-                MonitorController.DestroyPhysicalMonitor(hMonitor);
             }
+
+            monitorList = monitorList.OrderBy(m => m.Description).ToList();
+            sw.Stop();
 
             ServerStatus status = new()
             {
@@ -696,7 +828,40 @@ namespace MultiDisplayVCPServer
                 Message = $"OK: Found {monitorList.Count} DDC/CI compliant monitors."
             };
 
-            Log("GetMonitorCapabilities() finished.");
+            // Write full diagnostic dump to monitor_dump.json
+            try
+            {
+                var fullDump = new
+                {
+                    TimestampUtc = DateTime.UtcNow.ToString("o"),
+                    ScanDurationMs = sw.ElapsedMilliseconds,
+                    WmiCount = pnpMap.Count,
+                    WmiPnpMap = pnpMap,
+                    PhysicalMonitorsEnumeratedCount = physicalMonitors.Count,
+                    EnumeratedMonitors = monitorDiags,
+                    FinalStatus = status
+                };
+
+                string dumpJson = JsonSerializer.Serialize(fullDump, _jsonOptions);
+
+                // 1. Next to the server executable
+                string appDirDump = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "monitor_dump.json");
+                File.WriteAllText(appDirDump, dumpJson);
+                Log($"Diagnostic dump written to {appDirDump}");
+
+                // 2. In LocalAppData
+                string localAppDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MultiDisplayVCPServer");
+                Directory.CreateDirectory(localAppDir);
+                string localAppDump = Path.Combine(localAppDir, "monitor_dump.json");
+                File.WriteAllText(localAppDump, dumpJson);
+                Log($"Diagnostic dump written to {localAppDump}");
+            }
+            catch (Exception ex)
+            {
+                Log($"Error writing diagnostic dump: {ex.Message}");
+            }
+
+            Log($"GetMonitorCapabilities() finished in {sw.ElapsedMilliseconds}ms. Found {monitorList.Count} monitor(s).");
             return status;
         }
 
@@ -948,6 +1113,79 @@ namespace MultiDisplayVCPServer
                 Log($"Error modifying registry for startup: {ex.Message}");
             }
             Log("SetStartup() finished.");
+        }
+
+        /// <summary>
+        /// Starts the MagicOnion gRPC host on the configured gRPC port (default 5002).
+        /// Runs alongside the TCP server (dual-mode). MessagePipe is registered for
+        /// inter-service messaging via IPublisher/ISubscriber.
+        /// </summary>
+        /// <param name="port">The HTTP/2 port to listen on.</param>
+        /// <param name="ct">Cancellation token for graceful shutdown.</param>
+        public static async Task StartGrpcHostAsync(int port, CancellationToken ct = default)
+        {
+            Log($"StartGrpcHostAsync() starting on port {port}...");
+            try
+            {
+                var builder = WebApplication.CreateBuilder();
+
+                // Bind to any IP — Macro Deck runs on a separate machine on the network.
+                // Windows Firewall will prompt once on first run; clicking Allow makes it permanent.
+                builder.WebHost.ConfigureKestrel(opts =>
+                {
+                    opts.ListenAnyIP(port, o => o.Protocols = HttpProtocols.Http2);
+                });
+
+                // Suppress Kestrel's verbose logging — we use our own Log().
+                builder.Logging.ClearProviders();
+
+                builder.Services.AddGrpc();
+                builder.Services.AddMagicOnion();
+                builder.Services.AddMessagePipe();
+                builder.Services.AddSingleton<Shared.IServerConfig, Windows.WindowsServerConfig>();
+                builder.Services.AddSingleton<Shared.IMonitorController, Windows.WindowsMonitorController>();
+
+                var app = builder.Build();
+                app.MapMagicOnionService();
+
+                _grpcApp = app;
+                await app.StartAsync(ct);
+                Log($"gRPC host started on port {port} (all interfaces).");
+            }
+            catch (Exception ex)
+            {
+                Log($"Failed to start gRPC host: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Gracefully stops and disposes the MagicOnion gRPC host.
+        /// Called from ShutdownServer() to ensure dual-mode teardown.
+        /// </summary>
+        public static async Task StopGrpcHostAsync()
+        {
+            Log("StopGrpcHostAsync() called.");
+            if (_grpcApp != null)
+            {
+                try
+                {
+                    await _grpcApp.StopAsync();
+                    await _grpcApp.DisposeAsync();
+                    Log("gRPC host stopped and disposed.");
+                }
+                catch (Exception ex)
+                {
+                    Log($"Error stopping gRPC host: {ex.Message}");
+                }
+                finally
+                {
+                    _grpcApp = null;
+                }
+            }
+            else
+            {
+                Log("StopGrpcHostAsync(): _grpcApp was null, nothing to stop.");
+            }
         }
 
         /// <summary>

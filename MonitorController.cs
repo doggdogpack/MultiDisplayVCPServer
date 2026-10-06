@@ -1,9 +1,12 @@
-﻿using System;
+using Cysharp.Text;
+using MultiDisplayVCPServer.Shared;
+using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Diagnostics;
 using Microsoft.Win32;
+using ZLinq;
 
 namespace MultiDisplayVCPServer
 {
@@ -72,6 +75,25 @@ namespace MultiDisplayVCPServer
     }
 
     /// <summary>
+    /// A P/Invoke structure that holds information about a display device.
+    /// Used by EnumDisplayDevices to obtain the native PnP ID.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    public struct DISPLAY_DEVICE
+    {
+        public int cb;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string DeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string DeviceString;
+        public int StateFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string DeviceID;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string DeviceKey;
+    }
+
+    /// <summary>
     /// A delegate (callback function) used by EnumDisplayMonitors.
     /// </summary>
     public delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
@@ -98,6 +120,12 @@ namespace MultiDisplayVCPServer
         #region P/Invoke DllImports
 
         // --- FIX: Reverted all to [DllImport] ---
+
+        /// <summary>
+        /// Obtains information about the display devices in the current session.
+        /// </summary>
+        [DllImport("user32.dll", CharSet = CharSet.Ansi)]
+        public static extern bool EnumDisplayDevices(string? lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
 
         /// <summary>
         /// Enumerates display monitors (including virtual monitors that mirror part of the desktop).
@@ -181,6 +209,7 @@ namespace MultiDisplayVCPServer
 
         /// <summary>
         /// Enumerates all physical monitors attached to the system that respond to DDC/CI.
+        /// Extracts hardware PnP IDs directly via native EnumDisplayDevices and matches friendly names.
         /// </summary>
         /// <param name="pnpMap">A WMI-generated dictionary mapping DDC/CI Descriptions to PnP Model IDs.</param>
         /// <returns>A list of PhysicalMonitorData objects, one for each valid monitor.</returns>
@@ -210,26 +239,56 @@ namespace MultiDisplayVCPServer
                             for (int i = 0; i < physicalMonitorCount; i++)
                             {
                                 var pMonitor = pMonitors[i];
-                                // Get the DDC/CI description name
-                                string description = new string(pMonitor.szPhysicalMonitorDescription).Trim('\0');
-                                Debug.WriteLine($"Processing physical monitor {i}: Handle={pMonitor.hPhysicalMonitor}, Description='{description}'");
+                                // Get the raw DDC/CI description name reported by driver
+                                string rawDescription = new string(pMonitor.szPhysicalMonitorDescription).Trim('\0');
+                                Debug.WriteLine($"Processing physical monitor {i}: Handle={pMonitor.hPhysicalMonitor}, RawDescription='{rawDescription}'");
 
-                                // Use the description to look up the stable PnP_ID from our WMI map
-                                pnpMap.TryGetValue(description, out string pnpId);
-                                if (string.IsNullOrEmpty(pnpId))
+                                // Direct native hardware query: get the stable PnP ID from Windows display driver
+                                string pnpId = string.Empty;
+                                try
                                 {
-                                    Debug.WriteLine($"PnP_ID not found in WMI map for '{description}'.");
+                                    var dd = new DISPLAY_DEVICE();
+                                    dd.cb = Marshal.SizeOf(dd);
+                                    if (EnumDisplayDevices(devicePath, (uint)i, ref dd, 0) && !string.IsNullOrEmpty(dd.DeviceID))
+                                    {
+                                        var parts = dd.DeviceID.Split('\\');
+                                        if (parts.Length > 1)
+                                        {
+                                            pnpId = parts[1]; // e.g. "ACR0D1D"
+                                            Debug.WriteLine($"Native EnumDisplayDevices matched PnP_ID: {pnpId} for {devicePath}");
+                                        }
+                                    }
                                 }
-                                else
+                                catch (Exception ex)
                                 {
-                                    Debug.WriteLine($"Found matching PnP_ID: {pnpId}");
+                                    Debug.WriteLine($"EnumDisplayDevices error for {devicePath}: {ex.Message}");
+                                }
+
+                                // Fallback: lookup by description in WMI map if native query didn't return a PnP ID
+                                if (string.IsNullOrEmpty(pnpId) && pnpMap != null)
+                                {
+                                    pnpMap.TryGetValue(rawDescription, out pnpId);
+                                }
+
+                                // Resolve friendly description: prefer human-readable name from WMI map
+                                string friendlyDescription = rawDescription;
+                                if (!string.IsNullOrEmpty(pnpId) && pnpMap != null && pnpMap.TryGetValue(pnpId, out string descFromMap) && !string.IsNullOrWhiteSpace(descFromMap))
+                                {
+                                    friendlyDescription = descFromMap;
+                                }
+                                else if (string.IsNullOrWhiteSpace(friendlyDescription) || friendlyDescription.Equals("Generic PnP Monitor", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    if (!string.IsNullOrEmpty(pnpId))
+                                    {
+                                        friendlyDescription = pnpId;
+                                    }
                                 }
 
                                 allMonitors.Add(new PhysicalMonitorData
                                 {
                                     Handle = pMonitor.hPhysicalMonitor,
-                                    Description = description,
-                                    DeviceID = $"{devicePath}\\Monitor{i}", // The unstable ID
+                                    Description = friendlyDescription,
+                                    DeviceID = $"{devicePath}\\Monitor{i}", // The device path ID
                                     PnP_ID = pnpId ?? string.Empty // The stable ID
                                 });
                             }
@@ -250,6 +309,127 @@ namespace MultiDisplayVCPServer
             Debug.WriteLine($"EnumDisplayMonitors finished. Found {allMonitors.Count} total physical monitors.");
             Debug.WriteLine("EnumeratePhysicalMonitors() finished.");
             return allMonitors;
+        }
+
+
+        /// <summary>
+        /// Returns the cached monitor list mapped to the gRPC DTO format.
+        /// Called by VcpService.GetCapabilitiesAsync. Uses ZLinq for zero-allocation projection.
+        /// </summary>
+        public static CapabilitiesResponse GetCachedCapabilities()
+        {
+            if (Program.IsCacheWarming)
+            {
+                // Wait briefly if cache is currently warming up
+                try
+                {
+                    Program.EnsureCacheWarmedAsync(10000).GetAwaiter().GetResult();
+                }
+                catch { }
+            }
+
+            // Retrieve the cached ServerStatus from Program (the authoritative store)
+            var cached = Program.GetCachedStatus();
+
+            if (Program.IsCacheWarming)
+            {
+                return new CapabilitiesResponse
+                {
+                    Success = false,
+                    Message = cached.Message ?? "WARMING: Monitor cache is still initializing. Please retry shortly.",
+                    Monitors = []
+                };
+            }
+
+            // Use ZLinq for zero-allocation projection of monitors and features
+            var monitors = cached.Monitors
+                .AsValueEnumerable()
+                .Select(m => new MonitorInfoDto
+                {
+                    DeviceID = m.DeviceID,
+                    Description = m.Description,
+                    Capabilities = m.Capabilities
+                        .AsValueEnumerable()
+                        .Select(f => new VcpFeatureDto
+                        {
+                            Code = f.Code,
+                            Name = f.Name,
+                            Type = f.Type ?? string.Empty,
+                            ReadWrite = f.ReadWrite,
+                            CurrentValue = f.CurrentValue,
+                            MaximumValue = f.MaximumValue,
+                            NonContinuousValues = f.NonContinuousValues ?? []
+                        })
+                        .ToList()
+                })
+                .ToList();
+
+            return new CapabilitiesResponse
+            {
+                Success = true,
+                Message = ZString.Format("OK: Found {0} monitor(s).", monitors.Count),
+                Monitors = monitors
+            };
+        }
+
+        /// <summary>
+        /// Sets a VCP feature on the monitor identified by PnP ID.
+        /// Called by VcpService.SetVcpAsync. Opens a fresh monitor handle for the DDC/CI call.
+        /// </summary>
+        public static SetVcpResponse SetVcp(string monitorPnpId, byte vcpCode, uint value)
+        {
+            Debug.WriteLine($"MonitorController.SetVcp() called: {monitorPnpId} 0x{vcpCode:X2}={value}");
+
+            var pnpToDescMap = MonitorWmiHelper.GetPnPMonitorMap();
+            pnpToDescMap.TryGetValue(monitorPnpId, out string? targetDescription);
+
+            // Enumerate monitors and find the matching handle directly
+            var monitors = EnumeratePhysicalMonitors(MonitorWmiHelper.GetMonitorPnPMap());
+            IntPtr foundHandle = (IntPtr)(-1);
+
+            try
+            {
+                foreach (var mon in monitors)
+                {
+                    bool matches = mon.PnP_ID.Equals(monitorPnpId, StringComparison.OrdinalIgnoreCase)
+                                || mon.DeviceID.Equals(monitorPnpId, StringComparison.OrdinalIgnoreCase)
+                                || mon.PnP_ID.Contains(monitorPnpId, StringComparison.OrdinalIgnoreCase)
+                                || (!string.IsNullOrEmpty(targetDescription) && mon.Description.Equals(targetDescription, StringComparison.OrdinalIgnoreCase));
+
+                    if (matches)
+                    {
+                        foundHandle = mon.Handle;
+                        break;
+                    }
+                }
+
+                if (foundHandle == (IntPtr)(-1))
+                {
+                    return new SetVcpResponse
+                    {
+                        Success = false,
+                        Message = ZString.Format("ERROR: Monitor '{0}' not found or handle unavailable.", monitorPnpId)
+                    };
+                }
+
+                bool ok = SetVCPFeature(foundHandle, vcpCode, value);
+                if (ok)
+                {
+                    Program.UpdateCache(monitorPnpId, vcpCode, value);
+                }
+
+                return ok
+                    ? new SetVcpResponse { Success = true, Message = ZString.Format("OK: Set 0x{0:X2} = {1} on {2}.", vcpCode, value, monitorPnpId) }
+                    : new SetVcpResponse { Success = false, Message = ZString.Format("ERROR: SetVCPFeature failed for 0x{0:X2} on {1}.", vcpCode, monitorPnpId) };
+            }
+            finally
+            {
+                // Clean up all monitor handles
+                foreach (var mon in monitors)
+                {
+                    DestroyPhysicalMonitor(mon.Handle);
+                }
+            }
         }
 
         /// <summary>

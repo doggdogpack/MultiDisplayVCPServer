@@ -1,27 +1,41 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
-    <Version>1.1.1</Version>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Version>2.0.0</Version>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <StartupObject></StartupObject>
     <UseWPF>False</UseWPF>
     <ApplicationIcon>monitor.ico</ApplicationIcon>
+    <!-- Pre-JIT at publish time: eliminates cold JIT overhead on first run (especially on HDD) -->
+    <PublishReadyToRun>true</PublishReadyToRun>
+    <!-- Profile-guided optimization: improves steady-state throughput -->
+    <TieredPGO>true</TieredPGO>
+    <Authors>DoggoDogPack</Authors>
+    <PackageId>DoggoDogPack.MultiDisplayVCPServer</PackageId>
+    <RepositoryUrl>https://github.com/doggdogpack/MultiDisplayVCPServer</RepositoryUrl>
+    <Product>MultiDisplayVCP Server</Product>
   </PropertyGroup>
-
-  <ItemGroup>
-    <None Remove="swxr2uuy.ndn~" />
-  </ItemGroup>
 
   <ItemGroup>
     <Content Include="monitor.ico" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.Management" Version="9.0.10" />
+    <PackageReference Include="System.Management" Version="10.0.0" />
+    <PackageReference Include="MagicOnion.Server" Version="7.11.0" />
+    <PackageReference Include="MemoryPack" Version="1.21.4" />
+    <PackageReference Include="ZString" Version="2.6.0" />
+    <PackageReference Include="MessagePipe" Version="1.8.2" />
+    <PackageReference Include="ZLinq" Version="1.5.6" />
+    <PackageReference Include="ObservableCollections" Version="3.3.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
   
   <ItemGroup>
