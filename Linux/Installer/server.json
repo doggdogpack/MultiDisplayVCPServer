@@ -1,0 +1,5 @@
+{
+  "port": 5001,
+  "grpcPort": 5002,
+  "password": "changeme"
+}

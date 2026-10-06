@@ -9,7 +9,7 @@ namespace MultiDisplayVCPServer.Linux
     /// </summary>
     public class LinuxServerConfig : IServerConfig
     {
-        public int Port { get; set; } = 21000;
+        public int Port { get; set; } = 5001;
         public int GrpcPort { get; set; } = 5002;
         public string Password { get; set; } = "changeme";
         public int ServerState { get; set; } = 0;

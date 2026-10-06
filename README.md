@@ -73,6 +73,45 @@ Pre-built packages and installers are available in the [Releases](https://github
 
 ---
 
+## ⚙️ Configuration (macOS & Linux)
+
+The Windows edition provides a system tray and graphical window to configure settings. Because macOS and Linux run as headless background daemons, their settings are stored in a standard `server.json` file.
+
+### Configuration Locations
+* **macOS**: `~/Library/Application Support/MultiDisplayVCP/server.json`
+* **Linux**: `/etc/multidisplayvcp/server.json`
+
+### Configuration Format
+```json
+{
+  "port": 5001,
+  "grpcPort": 5002,
+  "password": "changeme"
+}
+```
+*(Default password is `changeme` if unconfigured).*
+
+### Applying Changes
+After editing `server.json`, reload the background service:
+
+* **macOS**:
+  ```bash
+  launchctl unload ~/Library/LaunchAgents/com.multidisplayvcp.server.plist
+  launchctl load -w ~/Library/LaunchAgents/com.multidisplayvcp.server.plist
+  ```
+
+* **Linux**:
+  ```bash
+  sudo systemctl restart multidisplayvcp
+  ```
+
+### CLI Overrides & Environment Variables
+You can also customize settings without a file:
+* **Command Line Flags**: `--password <secret>`, `--port <num>`, `--grpc-port <num>`, `--config <path>`
+* **Environment Variables**: `VCP_PASSWORD`, `VCP_PORT`, `VCP_GRPC_PORT`
+
+---
+
 ## 🔌 Open Protocol Specification
 
 Any client can control displays via the TCP port using simple HMAC-SHA256 authenticated commands:

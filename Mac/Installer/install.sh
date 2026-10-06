@@ -26,6 +26,27 @@ sudo mkdir -p "${BIN_DIR}"
 sudo cp -f "${BIN_PATH}" "${BIN_DIR}/MultiDisplayVCPServer.Mac"
 sudo chmod +x "${BIN_DIR}/MultiDisplayVCPServer.Mac"
 
+echo "-> Setting up configuration..."
+CONFIG_DIR="${HOME}/Library/Application Support/MultiDisplayVCP"
+CONFIG_FILE="${CONFIG_DIR}/server.json"
+mkdir -p "${CONFIG_DIR}"
+if [ ! -f "${CONFIG_FILE}" ]; then
+  if [ -f "${SCRIPT_DIR}/server.json" ]; then
+    cp -f "${SCRIPT_DIR}/server.json" "${CONFIG_FILE}"
+  else
+    cat << 'EOF' > "${CONFIG_FILE}"
+{
+  "port": 5001,
+  "grpcPort": 5002,
+  "password": "changeme"
+}
+EOF
+  fi
+  echo "   Created default config at: ${CONFIG_FILE}"
+else
+  echo "   Existing config preserved at: ${CONFIG_FILE}"
+fi
+
 echo "-> Setting up launchd service..."
 mkdir -p "${USER_LAUNCH_DIR}"
 cp -f "${SCRIPT_DIR}/${PLIST_NAME}" "${USER_LAUNCH_DIR}/${PLIST_NAME}"
@@ -36,6 +57,18 @@ launchctl unload "${USER_LAUNCH_DIR}/${PLIST_NAME}" 2>/dev/null || true
 launchctl load -w "${USER_LAUNCH_DIR}/${PLIST_NAME}"
 
 echo ""
-echo "MultiDisplayVCP Server installed and running in background!"
+echo "=========================================================="
+echo "  MultiDisplayVCP Server installed and active!"
+echo "=========================================================="
+echo "Configuration: ${CONFIG_FILE}"
+echo "Default password: changeme"
+echo ""
+echo "To set your password or change ports:"
+echo "  1. Edit '${CONFIG_FILE}'"
+echo "  2. Run:"
+echo "     launchctl unload ${USER_LAUNCH_DIR}/${PLIST_NAME}"
+echo "     launchctl load -w ${USER_LAUNCH_DIR}/${PLIST_NAME}"
+echo ""
 echo "Logs:   /tmp/multidisplayvcp.log"
 echo "Errors: /tmp/multidisplayvcp.err"
+echo "=========================================================="

@@ -37,6 +37,28 @@ if command -v usermod &> /dev/null && [ -n "$SUDO_USER" ]; then
 fi
 modprobe i2c-dev 2>/dev/null || true
 
+CONFIG_DIR="/etc/multidisplayvcp"
+CONFIG_FILE="${CONFIG_DIR}/server.json"
+echo "-> Setting up configuration at ${CONFIG_FILE}..."
+mkdir -p "${CONFIG_DIR}"
+if [ ! -f "${CONFIG_FILE}" ]; then
+  if [ -f "${SCRIPT_DIR}/server.json" ]; then
+    cp -f "${SCRIPT_DIR}/server.json" "${CONFIG_FILE}"
+  else
+    cat << 'EOF' > "${CONFIG_FILE}"
+{
+  "port": 5001,
+  "grpcPort": 5002,
+  "password": "changeme"
+}
+EOF
+  fi
+  chmod 644 "${CONFIG_FILE}"
+  echo "   Created default config at: ${CONFIG_FILE}"
+else
+  echo "   Existing config preserved at: ${CONFIG_FILE}"
+fi
+
 # Install systemd service
 if [ -f "${SCRIPT_DIR}/multidisplayvcp.service" ]; then
   echo "-> Installing systemd service..."
@@ -48,6 +70,16 @@ if [ -f "${SCRIPT_DIR}/multidisplayvcp.service" ]; then
 fi
 
 echo ""
-echo "MultiDisplayVCP Server installed successfully!"
+echo "=========================================================="
+echo "  MultiDisplayVCP Server installed and active!"
+echo "=========================================================="
+echo "Configuration: ${CONFIG_FILE}"
+echo "Default password: changeme"
+echo ""
+echo "To set your password or change ports:"
+echo "  1. Edit '${CONFIG_FILE}'"
+echo "  2. Run: sudo systemctl restart multidisplayvcp"
+echo ""
 echo "Check status:  sudo systemctl status multidisplayvcp"
 echo "View logs:     sudo journalctl -u multidisplayvcp -f"
+echo "=========================================================="
