@@ -30,6 +30,7 @@ fi
 echo "-> Installing binary to ${INSTALL_DIR}..."
 cp -f "${BIN_PATH}" "${INSTALL_DIR}/MultiDisplayVCPServer.Linux"
 chmod +x "${INSTALL_DIR}/MultiDisplayVCPServer.Linux"
+[ -f "${SCRIPT_DIR}/uninstall.sh" ] && chmod +x "${SCRIPT_DIR}/uninstall.sh" 2>/dev/null || true
 
 echo "-> Configuring i2c permissions (ddcutil requirement)..."
 if command -v usermod &> /dev/null && [ -n "$SUDO_USER" ]; then

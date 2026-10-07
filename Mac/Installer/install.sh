@@ -25,6 +25,7 @@ echo "-> Installing binary to ${BIN_DIR}..."
 sudo mkdir -p "${BIN_DIR}"
 sudo cp -f "${BIN_PATH}" "${BIN_DIR}/MultiDisplayVCPServer.Mac"
 sudo chmod +x "${BIN_DIR}/MultiDisplayVCPServer.Mac"
+[ -f "${SCRIPT_DIR}/uninstall.sh" ] && chmod +x "${SCRIPT_DIR}/uninstall.sh" 2>/dev/null || true
 
 echo "-> Setting up configuration..."
 CONFIG_DIR="${HOME}/Library/Application Support/MultiDisplayVCP"

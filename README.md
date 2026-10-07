@@ -52,24 +52,33 @@ Pre-built packages and installers are available in the [Releases](https://github
    ```
 3. Run the automated installer:
    ```bash
-   sudo ./install.sh
+   chmod +x install.sh && sudo ./install.sh
    ```
    *(Installs binary to `/usr/local/bin`, configures I2C group permissions, and installs/starts the `multidisplayvcp.service` systemd unit).*
 
 ### macOS (Apple Silicon & Intel)
+
+> [!NOTE]
+> **MacBook Displays**: Apple locks down built-in MacBook laptop displays, so they cannot be controlled via DDC/CI. However, **any external monitor** plugged into your Mac (HDMI, USB-C, DisplayPort) works seamlessly. Ensure **DDC/CI is enabled** in your monitor's on-screen hardware menu!
+
 1. Install prerequisite:
    ```bash
    brew install ddcctl
    ```
-2. Download and extract **`MultiDisplayVCPServer_macOS_<arch>_v2.0.0.tar.gz`** (choose `arm64` for M1/M2/M3/M4 or `x64` for Intel):
+2. Download and extract **`MultiDisplayVCPServer_macOS_<arch>_v2.0.0.tar.gz`** (choose `arm64` for Apple Silicon M1/M2/M3/M4 or `x64` for Intel):
    ```bash
    tar -xzf MultiDisplayVCPServer_macOS_<arch>_v2.0.0.tar.gz
    ```
 3. Run the automated installer:
    ```bash
-   ./install.sh
+   chmod +x install.sh && ./install.sh
    ```
-   *(Installs binary to `/usr/local/bin` and registers/loads the `com.multidisplayvcp.server` background LaunchAgent).*
+   *(Installs the self-contained standalone binary to `/usr/local/bin` and registers/loads the `com.multidisplayvcp.server` background LaunchAgent).*
+
+4. **Verify your monitors**:
+   ```bash
+   /usr/local/bin/MultiDisplayVCPServer.Mac --scan
+   ```
 
 ---
 
